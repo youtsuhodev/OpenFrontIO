@@ -305,6 +305,46 @@ describe("Player update diffing (toUpdate)", () => {
     }
   });
 
+  test("unchanged alliance collections are reused by reference across ticks", () => {
+    alice.toUpdate();
+    bob.toUpdate();
+    const request = alice.createAllianceRequest(bob);
+    expect(request).not.toBeNull();
+    request!.accept();
+
+    const withAlliance = alice.toUpdate()!;
+    expect(withAlliance.allies).toEqual([bob.smallID()]);
+
+    // Next tick nothing changed: the emitted snapshot must hand back the same
+    // array/object references instead of mapping fresh ones, or the per-tick
+    // allocation the diff path was built to avoid comes straight back.
+    expect(alice.toUpdate()).toBeNull();
+    expect(alice.lastSentUpdate!.allies).toBe(withAlliance.allies);
+    expect(alice.lastSentUpdate!.alliances).toBe(withAlliance.alliances);
+  });
+
+  test("a live outgoing attack array is reused while membership is unchanged", () => {
+    // Expand alice until she borders bob, then start an attack so she has a
+    // non-empty outgoing array.
+    game.addExecution(
+      new AttackExecution(2000, alice, game.terraNullius().id()),
+    );
+    for (let i = 0; i < 30 && !alice.sharesBorderWith(bob); i++) {
+      game.executeNextTick();
+    }
+    game.addExecution(new AttackExecution(5000, alice, bob.id()));
+    game.executeNextTick();
+
+    alice.toUpdate();
+    const ref = alice.lastSentUpdate!.outgoingAttacks!;
+    expect(ref.length).toBeGreaterThan(0);
+
+    // No tick runs between these calls, so membership and troops are stable:
+    // the same array must be reused (a fresh map would be a new reference).
+    expect(alice.toUpdate()).toBeNull();
+    expect(alice.lastSentUpdate!.outgoingAttacks).toBe(ref);
+  });
+
   test("in-worker mutation of shared empty collections fails loudly", () => {
     const charlieInfo = new PlayerInfo(
       "charlie2",

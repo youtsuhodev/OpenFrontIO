@@ -48,7 +48,6 @@ import {
   ATTACK_DELTA_INCOMING,
   ATTACK_DELTA_OUTGOING,
   diffPlayerUpdate,
-  packAttackTroopDeltas,
 } from "./GameUpdateUtils";
 import {
   AllianceView,
@@ -108,6 +107,59 @@ Object.freeze(EMPTY_STRING_ARRAY);
 Object.freeze(EMPTY_ATTACK_UPDATES);
 Object.freeze(EMPTY_ALLIANCE_VIEWS);
 Object.freeze(EMPTY_EMOJIS);
+
+/**
+ * Whether `prev` and the live outgoing attack list describe the same attacks
+ * in the same order, ignoring troop counts (which travel as packed quads).
+ * Allocation-free so toFullUpdate can decide to reuse the previous array
+ * instead of mapping a fresh one every tick.
+ */
+function outgoingAttacksMembershipEqual(
+  prev: AttackUpdate[],
+  attacks: Attack[],
+): boolean {
+  if (prev.length !== attacks.length) return false;
+  for (let i = 0; i < attacks.length; i++) {
+    const a = attacks[i];
+    const p = prev[i];
+    if (
+      p.attackerID !== a.attacker().smallID() ||
+      p.targetID !== a.target().smallID() ||
+      p.id !== a.id() ||
+      p.retreating !== a.retreating()
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Incoming counterpart of outgoingAttacksMembershipEqual: the emitted array is
+ * `_incomingAttacks` filtered to attacks whose attacker is still alive, so dead
+ * attackers are skipped here too.
+ */
+function incomingAttacksMembershipEqual(
+  prev: AttackUpdate[],
+  attacks: Attack[],
+): boolean {
+  let i = 0;
+  for (const a of attacks) {
+    if (!a.attacker().isAlive()) continue;
+    if (i >= prev.length) return false;
+    const p = prev[i];
+    if (
+      p.attackerID !== a.attacker().smallID() ||
+      p.targetID !== a.target().smallID() ||
+      p.id !== a.id() ||
+      p.retreating !== a.retreating()
+    ) {
+      return false;
+    }
+    i++;
+  }
+  return i === prev.length;
+}
 
 export class PlayerImpl implements Player {
   public _lastTileChange: number = 0;
@@ -188,6 +240,14 @@ export class PlayerImpl implements Player {
    */
   public lastSentUpdate: PlayerUpdate | undefined;
 
+  // Troop counts last communicated on the packed attack channel, indexed by
+  // the attack's position in the emitted array. Kept off the emitted
+  // PlayerUpdate (which is never mutated once queued) so the outgoing/incoming
+  // attack arrays can be reused across ticks while membership is unchanged.
+  // See syncAttackTroops().
+  private _sentOutgoingTroops: number[] = [];
+  private _sentIncomingTroops: number[] = [];
+
   constructor(
     private mg: GameImpl,
     private _smallID: number,
@@ -223,10 +283,16 @@ export class PlayerImpl implements Player {
     statsOut?: number[],
     attackTroopsOut?: number[],
   ): PlayerUpdate | null {
-    const full = this.toFullUpdate();
     const prev = this.lastSentUpdate;
+    const full = this.toFullUpdate(prev);
     this.lastSentUpdate = full;
-    if (prev === undefined) return full;
+    if (prev === undefined) {
+      // First emission carries every field, stats included. Baseline the
+      // troop trackers so later ticks emit only real deltas.
+      this.syncAttackTroops(false, false, ATTACK_DELTA_OUTGOING, undefined);
+      this.syncAttackTroops(true, false, ATTACK_DELTA_INCOMING, undefined);
+      return full;
+    }
     if (
       statsOut !== undefined &&
       (prev.tilesOwned !== full.tilesOwned ||
@@ -245,112 +311,79 @@ export class PlayerImpl implements Player {
         Number(full.goldEarned),
       );
     }
-    if (attackTroopsOut !== undefined) {
-      packAttackTroopDeltas(
-        prev.outgoingAttacks,
-        full.outgoingAttacks,
-        full.smallID!,
-        ATTACK_DELTA_OUTGOING,
-        attackTroopsOut,
-      );
-      packAttackTroopDeltas(
-        prev.incomingAttacks,
-        full.incomingAttacks,
-        full.smallID!,
-        ATTACK_DELTA_INCOMING,
-        attackTroopsOut,
-      );
-    }
+    // Troop counts travel as packed quads only while the attack arrays are not
+    // being resent: a membership change makes diffPlayerUpdate resend the whole
+    // array (with fresh troops), so quad indexes would be meaningless.
+    this.syncAttackTroops(
+      false,
+      full.outgoingAttacks === prev.outgoingAttacks,
+      ATTACK_DELTA_OUTGOING,
+      attackTroopsOut,
+    );
+    this.syncAttackTroops(
+      true,
+      full.incomingAttacks === prev.incomingAttacks,
+      ATTACK_DELTA_INCOMING,
+      attackTroopsOut,
+    );
     return diffPlayerUpdate(prev, full);
   }
 
-  private toFullUpdate(): PlayerUpdate {
+  /**
+   * Keep the packed attack-troop channel in sync with the live attacks.
+   *
+   * `unchanged` is true when toFullUpdate reused the previous attack array
+   * (membership identical): the array will not be resent, so per-attack troop
+   * changes are pushed as `[smallID, direction, index, troops]` quads against
+   * the last communicated counts. When membership changed the array is resent
+   * whole, so this only re-baselines. `out` may be undefined for callers that
+   * don't consume the packed channel (tests); the baseline is still advanced so
+   * a later call never emits a stale cumulative delta.
+   */
+  private syncAttackTroops(
+    incoming: boolean,
+    unchanged: boolean,
+    direction: number,
+    out: number[] | undefined,
+  ): void {
+    const attacks = incoming ? this._incomingAttacks : this._outgoingAttacks;
+    const baseline = incoming
+      ? this._sentIncomingTroops
+      : this._sentOutgoingTroops;
+    let idx = 0;
+    if (unchanged) {
+      for (const a of attacks) {
+        if (incoming && !a.attacker().isAlive()) continue;
+        const troops = a.troops();
+        if (out !== undefined && baseline[idx] !== troops) {
+          out.push(this._smallID, direction, idx, troops);
+        }
+        baseline[idx] = troops;
+        idx++;
+      }
+    } else {
+      for (const a of attacks) {
+        if (incoming && !a.attacker().isAlive()) continue;
+        baseline[idx++] = a.troops();
+      }
+    }
+    baseline.length = idx;
+  }
+
+  private toFullUpdate(prev: PlayerUpdate | undefined): PlayerUpdate {
     // Empty collections reuse shared singletons (EMPTY_*) so
     // diffPlayerUpdate's reference fast paths hit and nothing is allocated.
-    // This runs for every player every tick; most collections are empty for
-    // most players. The singletons are never mutated — updates are
-    // structured-cloned before leaving the worker.
-    let outgoingAllianceRequests = EMPTY_STRING_ARRAY;
-    for (const ar of this.mg.allianceRequests) {
-      if (ar.requestor() === this) {
-        if (outgoingAllianceRequests === EMPTY_STRING_ARRAY) {
-          outgoingAllianceRequests = [];
-        }
-        outgoingAllianceRequests.push(ar.recipient().id());
-      }
-    }
-
-    const alliances = this.alliances();
-    let allies = EMPTY_NUMBER_ARRAY;
-    let allianceViews = EMPTY_ALLIANCE_VIEWS;
-    if (alliances.length > 0) {
-      allies = alliances.map((a) => a.other(this).smallID());
-      const extensionCutoff =
-        this.mg.ticks() + this.mg.config().allianceExtensionPromptOffset();
-      allianceViews = alliances.map(
-        (a) =>
-          ({
-            id: a.id(),
-            other: a.other(this).id(),
-            createdAt: a.createdAt(),
-            expiresAt: a.expiresAt(),
-            hasExtensionRequest: a.expiresAt() <= extensionCutoff,
-          }) satisfies AllianceView,
-      );
-    }
-
-    let embargoes = EMPTY_EMBARGOES;
-    if (this.embargoes.size > 0) {
-      embargoes = new Set<string>();
-      for (const id of this.embargoes.keys()) {
-        embargoes.add(id.toString());
-      }
-    }
-
-    let targets = EMPTY_NUMBER_ARRAY;
-    if (this.targets_.length > 0) {
-      const t = this.targets();
-      if (t.length > 0) {
-        targets = t.map((p) => p.smallID());
-      }
-    }
-
-    let outgoingEmojis = EMPTY_EMOJIS;
-    if (this.outgoingEmojis_.length > 0) {
-      const e = this.outgoingEmojis();
-      if (e.length > 0) {
-        outgoingEmojis = e;
-      }
-    }
-
-    const outgoingAttacks =
-      this._outgoingAttacks.length === 0
-        ? EMPTY_ATTACK_UPDATES
-        : this._outgoingAttacks.map((a) => {
-            return {
-              attackerID: a.attacker().smallID(),
-              targetID: a.target().smallID(),
-              troops: a.troops(),
-              id: a.id(),
-              retreating: a.retreating(),
-            } satisfies AttackUpdate;
-          });
-
-    let incomingAttacks = EMPTY_ATTACK_UPDATES;
-    if (this._incomingAttacks.length > 0) {
-      const incoming = this.incomingAttacks();
-      if (incoming.length > 0) {
-        incomingAttacks = incoming.map((a) => {
-          return {
-            attackerID: a.attacker().smallID(),
-            targetID: a.target().smallID(),
-            troops: a.troops(),
-            id: a.id(),
-            retreating: a.retreating(),
-          } satisfies AttackUpdate;
-        });
-      }
-    }
+    // Non-empty collections are reused from `prev` too when the underlying
+    // data is unchanged, so an unchanged tick allocates no fresh arrays. This
+    // runs for every player every tick; the singletons and reused arrays are
+    // never mutated — updates are structured-cloned before leaving the worker.
+    const outgoingAllianceRequests = this.buildOutgoingAllianceRequests(prev);
+    const { allies, allianceViews } = this.buildAllianceFields(prev);
+    const embargoes = this.buildEmbargoes(prev);
+    const targets = this.buildTargets(prev);
+    const outgoingEmojis = this.buildOutgoingEmojis(prev);
+    const outgoingAttacks = this.buildOutgoingAttacks(prev);
+    const incomingAttacks = this.buildIncomingAttacks(prev);
 
     // OFM live standings: elimination info is stored on the player's stats
     // (set live in the sim via mg.stats()), surfaced here so it rides the live
@@ -398,6 +431,194 @@ export class PlayerImpl implements Player {
       lastDeleteUnitTick: this.lastDeleteUnitTick,
       isLobbyCreator: this.isLobbyCreator(),
     };
+  }
+
+  private buildOutgoingAllianceRequests(
+    prev: PlayerUpdate | undefined,
+  ): string[] {
+    const prevRequests = prev?.outgoingAllianceRequests;
+    if (
+      prevRequests !== undefined &&
+      this.outgoingAllianceRequestsEqual(prevRequests)
+    ) {
+      return prevRequests;
+    }
+    let out: string[] | undefined;
+    for (const ar of this.mg.allianceRequests) {
+      if (ar.requestor() === this) {
+        out ??= [];
+        out.push(ar.recipient().id());
+      }
+    }
+    return out ?? EMPTY_STRING_ARRAY;
+  }
+
+  private outgoingAllianceRequestsEqual(prev: string[]): boolean {
+    let i = 0;
+    for (const ar of this.mg.allianceRequests) {
+      if (ar.requestor() !== this) continue;
+      if (i >= prev.length || prev[i] !== ar.recipient().id()) return false;
+      i++;
+    }
+    return i === prev.length;
+  }
+
+  private buildAllianceFields(prev: PlayerUpdate | undefined): {
+    allies: number[];
+    allianceViews: AllianceView[];
+  } {
+    const alliances = this.alliances();
+    if (alliances.length === 0) {
+      return {
+        allies: EMPTY_NUMBER_ARRAY,
+        allianceViews: EMPTY_ALLIANCE_VIEWS,
+      };
+    }
+    const extensionCutoff =
+      this.mg.ticks() + this.mg.config().allianceExtensionPromptOffset();
+    if (prev !== undefined && this.alliancesEqual(prev, extensionCutoff)) {
+      return { allies: prev.allies!, allianceViews: prev.alliances! };
+    }
+    return {
+      allies: alliances.map((a) => a.other(this).smallID()),
+      allianceViews: alliances.map(
+        (a) =>
+          ({
+            id: a.id(),
+            other: a.other(this).id(),
+            createdAt: a.createdAt(),
+            expiresAt: a.expiresAt(),
+            hasExtensionRequest: a.expiresAt() <= extensionCutoff,
+          }) satisfies AllianceView,
+      ),
+    };
+  }
+
+  private alliancesEqual(prev: PlayerUpdate, cutoff: number): boolean {
+    const prevAllies = prev.allies;
+    const prevViews = prev.alliances;
+    if (prevAllies === undefined || prevViews === undefined) return false;
+    const alliances = this.alliances();
+    if (
+      prevAllies.length !== alliances.length ||
+      prevViews.length !== alliances.length
+    ) {
+      return false;
+    }
+    for (let i = 0; i < alliances.length; i++) {
+      const a = alliances[i];
+      const other = a.other(this);
+      if (prevAllies[i] !== other.smallID()) return false;
+      const pv = prevViews[i];
+      if (
+        pv.id !== a.id() ||
+        pv.other !== other.id() ||
+        pv.createdAt !== a.createdAt() ||
+        pv.expiresAt !== a.expiresAt() ||
+        pv.hasExtensionRequest !== a.expiresAt() <= cutoff
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private buildEmbargoes(prev: PlayerUpdate | undefined): Set<string> {
+    if (this.embargoes.size === 0) return EMPTY_EMBARGOES;
+    const prevEmbargoes = prev?.embargoes;
+    if (prevEmbargoes !== undefined && this.embargoesEqual(prevEmbargoes)) {
+      return prevEmbargoes;
+    }
+    const out = new Set<string>();
+    for (const id of this.embargoes.keys()) {
+      out.add(id.toString());
+    }
+    return out;
+  }
+
+  private embargoesEqual(prev: Set<string>): boolean {
+    if (prev.size !== this.embargoes.size) return false;
+    for (const id of this.embargoes.keys()) {
+      if (!prev.has(id.toString())) return false;
+    }
+    return true;
+  }
+
+  private buildTargets(prev: PlayerUpdate | undefined): number[] {
+    if (this.targets_.length === 0) return EMPTY_NUMBER_ARRAY;
+    const t = this.targets();
+    if (t.length === 0) return EMPTY_NUMBER_ARRAY;
+    const prevTargets = prev?.targets;
+    if (prevTargets !== undefined && prevTargets.length === t.length) {
+      let equal = true;
+      for (let i = 0; i < t.length; i++) {
+        if (prevTargets[i] !== t[i].smallID()) {
+          equal = false;
+          break;
+        }
+      }
+      if (equal) return prevTargets;
+    }
+    return t.map((p) => p.smallID());
+  }
+
+  private buildOutgoingEmojis(prev: PlayerUpdate | undefined): EmojiMessage[] {
+    if (this.outgoingEmojis_.length === 0) {
+      const prevEmojis = prev?.outgoingEmojis;
+      return prevEmojis !== undefined && prevEmojis.length === 0
+        ? prevEmojis
+        : EMPTY_EMOJIS;
+    }
+    const e = this.outgoingEmojis();
+    return e.length > 0 ? e : EMPTY_EMOJIS;
+  }
+
+  private buildOutgoingAttacks(prev: PlayerUpdate | undefined): AttackUpdate[] {
+    const attacks = this._outgoingAttacks;
+    if (attacks.length === 0) return EMPTY_ATTACK_UPDATES;
+    const prevAttacks = prev?.outgoingAttacks;
+    if (
+      prevAttacks !== undefined &&
+      outgoingAttacksMembershipEqual(prevAttacks, attacks)
+    ) {
+      return prevAttacks;
+    }
+    return attacks.map(
+      (a) =>
+        ({
+          attackerID: a.attacker().smallID(),
+          targetID: a.target().smallID(),
+          troops: a.troops(),
+          id: a.id(),
+          retreating: a.retreating(),
+        }) satisfies AttackUpdate,
+    );
+  }
+
+  private buildIncomingAttacks(prev: PlayerUpdate | undefined): AttackUpdate[] {
+    const attacks = this._incomingAttacks;
+    let aliveCount = 0;
+    for (const a of attacks) {
+      if (a.attacker().isAlive()) aliveCount++;
+    }
+    if (aliveCount === 0) return EMPTY_ATTACK_UPDATES;
+    const prevAttacks = prev?.incomingAttacks;
+    if (
+      prevAttacks !== undefined &&
+      incomingAttacksMembershipEqual(prevAttacks, attacks)
+    ) {
+      return prevAttacks;
+    }
+    return this.incomingAttacks().map(
+      (a) =>
+        ({
+          attackerID: a.attacker().smallID(),
+          targetID: a.target().smallID(),
+          troops: a.troops(),
+          id: a.id(),
+          retreating: a.retreating(),
+        }) satisfies AttackUpdate,
+    );
   }
 
   smallID(): number {
